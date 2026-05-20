@@ -1,3 +1,10 @@
+# --------------------------------------------------------------------------------------
+# Project: OpenMicroManipulator
+# License: MIT (see LICENSE file for full description)
+#          All text in here must be included in any redistribution.
+# Author:  M. S. (diffraction limited)
+# --------------------------------------------------------------------------------------
+
 import threading
 import time
 import re
@@ -6,6 +13,7 @@ from enum import Enum
 import serial
 import numpy as np
 from colorama import Fore, Style, init
+from serial.tools import list_ports
 
 # --- SerialInterface --------------------------------------------------------------------------------------------------
 
@@ -59,18 +67,23 @@ class SerialInterface:
         self._response_string = ""
         self._response_status = None
         self._response_error_msg = None
+        self._stop_event = threading.Event()
+        self._reader_thread = None
 
-        self.connect(self.reconnect_timeout)
-
-        # Start reader thread
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self._reader_thread.start()
+        if self.connect(self.reconnect_timeout):
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
+            while not self._reader_thread.is_alive():
+                time.sleep(0.001)
 
 
     def connect(self, timeout):
         """
         Try to open the serial port. Retry until timeout expires.
         """
+        if self._stop_event.is_set():
+            return False
+
         deadline = time.time() + timeout
         print(Fore.MAGENTA, end='')
         print(f"[SerialInterface] Connecting to port '{self.port}'...", end='')
@@ -95,7 +108,7 @@ class SerialInterface:
         Asynchronous reader loop, collecting serial data into a buffer
         """
         buffer = ""
-        while True:
+        while not self._stop_event.is_set():
             try:
                 if self.serial is not None and self.serial.in_waiting:
                     char = self.serial.read(1).decode('ascii', errors='ignore')
@@ -108,6 +121,9 @@ class SerialInterface:
                 else:
                     time.sleep(0.001)
             except (serial.SerialException, OSError) as e:
+                if self._stop_event.is_set():
+                    break
+
                 print(Fore.MAGENTA+f"[SerialInterface] Lost connection: {e}"+Style.RESET_ALL)
                 try:
                     if self.serial is not None and self.serial.is_open:
@@ -195,8 +211,13 @@ class SerialInterface:
 
     def close(self):
         """Closes the serial port."""
+        self._stop_event.set()
         if self.serial and self.serial.is_open:
             self.serial.close()
+        self.serial = None
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=1.0)
 
 # --- OpenMicroStageInterface ------------------------------------------------------------------------------------------
 
@@ -212,19 +233,45 @@ class OpenMicroStageInterface:
     def __init__(self, show_communication=True, show_log_messages=True):
         self.serial = None
         self.workspace_transform = np.eye(4)
+        self.workspace_transform_inv = np.linalg.inv(self.workspace_transform)
         self.show_communication = show_communication
         self.show_log_messages = show_log_messages
         self.disable_message_callbacks = False
+
+    @staticmethod
+    def enumerate_devices():
+        devices = []
+
+        for port in sorted(list_ports.comports(), key=lambda item: item.device):
+            description = (port.description or "").strip()
+            label = port.device
+            if description and description.lower() != "n/a" and description != port.device:
+                label = f"{port.device} - {description}"
+
+            devices.append({
+                "id": port.device,
+                "label": label,
+                "port": port.device,
+            })
+
+        return devices
 
     def connect(self, port: str, baud_rate: int = 921600):
         def version_to_str(v):
             return f"v{v[0]}.{v[1]}.{v[2]}"
 
-        if self.serial is not None: self.disconnect()
-        self.serial = SerialInterface(port, baud_rate,
-                                      log_msg_callback=self.log_msg_callback,
-                                      command_msg_callback=self.command_msg_callback,
-                                      unsolicited_msg_callback=self.unsolicited_msg_callback)
+        if self.serial is not None:
+            self.disconnect()
+
+        serial_interface = SerialInterface(port, baud_rate,
+                                           log_msg_callback=self.log_msg_callback,
+                                           command_msg_callback=self.command_msg_callback,
+                                           unsolicited_msg_callback=self.unsolicited_msg_callback)
+        if serial_interface.serial is None:
+            serial_interface.close()
+            return False
+
+        self.serial = serial_interface
 
         self.disable_message_callbacks = True
         fw_version = self.read_firmware_version()
@@ -233,14 +280,22 @@ class OpenMicroStageInterface:
         if fw_version < min_fw_version:
             print(Fore.MAGENTA + f"Firmware version {version_to_str(fw_version)} incompatible. "
                                  f"At least {version_to_str(min_fw_version)} required" + Style.RESET_ALL)
+            self.serial.close()
             self.serial = None
+            print('')
+            self.disable_message_callbacks = False
+            return False
         print('')
         self.disable_message_callbacks = False
+        return True
 
     def disconnect(self):
         if self.serial is not None:
             self.serial.close()
             self.serial = None
+
+    def is_connected(self):
+        return self.serial is not None
 
     def log_msg_callback(self, log_level, msg):
         if not self.show_log_messages or self.disable_message_callbacks:
@@ -273,6 +328,7 @@ class OpenMicroStageInterface:
 
     def set_workspace_transform(self, transform):
         self.workspace_transform = transform
+        self.workspace_transform_inv = np.linalg.inv(self.workspace_transform)
 
     def get_workspace_transform(self):
         return self.workspace_transform
@@ -282,7 +338,11 @@ class OpenMicroStageInterface:
         if ok != SerialInterface.ReplyStatus.OK or len(response) == 0:
             return 0, 0, 0
 
-        major, minor, patch = map(int, re.match(r'v(\d+)\.(\d+)\.(\d+)', response).groups())
+        match = re.match(r'v(\d+)\.(\d+)\.(\d+)', response)
+        if match is None:
+            return 0, 0, 0
+
+        major, minor, patch = map(int, match.groups())
         return major,minor,patch
 
     def home(self, axis_list=None):
@@ -370,11 +430,17 @@ class OpenMicroStageInterface:
             res, msg = self.serial.send_command("M53\n")
             if res != SerialInterface.ReplyStatus.OK: return res
             elif msg.strip() == "1":
+                self.disable_message_callbacks = disable_message_callbacks_prev
                 return SerialInterface.ReplyStatus.OK
+            time.sleep(polling_interval_ms*0.001)
 
         self.disable_message_callbacks = disable_message_callbacks_prev
 
-    def read_current_position(self):
+    def read_current_position(self, apply_inv_workspace_transform):
+        """
+        Reads the current position of the dives EXCLUDING the workspace transform.
+        If you want to use the result with a
+        """
         ok, response = self.serial.send_command("M50")
         if ok != SerialInterface.ReplyStatus.OK or len(response) == 0:
             return None, None, None
@@ -388,6 +454,10 @@ class OpenMicroStageInterface:
             raise ValueError(f"Invalid format: {response}")
 
         x, y, z = match.groups()
+        if apply_inv_workspace_transform:
+            transformed = self.workspace_transform_inv @ np.array([float(x), float(y), float(z), 1.0])
+            x, y, z = transformed[:3] / transformed[3]
+
         return float(x), float(y), float(z)
 
     def read_encoder_angles(self):
@@ -398,25 +468,36 @@ class OpenMicroStageInterface:
 
     def read_device_state_info(self):
         res, msg = self.serial.send_command("M57")
-        return res
+        return res, msg
 
     def set_servo_parameter(self, pos_kp=150, pos_ki=50000, vel_kp=0.2, vel_ki=100, vel_filter_tc=0.0025):
         cmd = f"M55 A{pos_kp:.6f} B{pos_ki:.6f} C{vel_kp:.6f} D{vel_ki:.6f} F{vel_filter_tc:.6f}"
         res, msg = self.serial.send_command(cmd)
         return res
 
-    def enable_motors(self, enable):
+    def enable_motors(self, enable: bool):
         cmd = f"M17" if enable else "M18"
         res, msg = self.serial.send_command(cmd, timeout=5)
         return res
 
-    def set_pose(self, x, y, z):
+    def set_pose(self, x: float, y: float, z: float):
         # Convert to homogeneous vector
         transformed = self.workspace_transform @ np.array([x, y, z, 1.0])
         x_t, y_t, z_t = transformed[:3] / transformed[3]
 
         cmd = f"G24 X{x_t:.6f} Y{y_t:.6f} Z{z_t:.6f}" # TODO: A, B ,C
         res, msg = self.serial.send_command(cmd)
+        return res
+
+    def set_tool_output(self, tool_idx: int, output_value: float, immediate: bool = True):
+        # sets the output value for the specified tool
+        cmd = f"M3 T{tool_idx} S{output_value}"
+        res, msg = self.serial.send_command(cmd)
+
+        # send dwell command to update tool value immediately
+        if immediate:
+            self.serial.send_command("G4 S0.001")
+
         return res
 
     def send_command(self, cmd: str, timeout_s: float=5):
