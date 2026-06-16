@@ -16,6 +16,13 @@ import numpy as np
 from colorama import Fore, Style, init
 from serial.tools import list_ports
 
+# --- Check Python version --------------------------------------------------------------------------------------------
+import sys
+if sys.version_info[0:2] > (3, 10):
+    raise Exception('Requires python 3.10 or older')
+# tested with 3.10
+
+
 # --- SerialInterface --------------------------------------------------------------------------------------------------
 
 class SerialInterface:

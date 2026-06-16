@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 .DS_Store
 ._*
+
+
+# my ignore
+OpenMicroManipulatorGUI/
+.uf2
