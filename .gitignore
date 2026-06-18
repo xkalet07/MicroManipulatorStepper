@@ -6,4 +6,4 @@ __pycache__/
 
 # my ignore
 OpenMicroManipulatorGUI/
-.uf2
+*.uf2
